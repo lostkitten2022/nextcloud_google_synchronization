@@ -25,6 +25,7 @@ use Throwable;
 
 /**
  * Service to make requests to Google v3 (JSON) API
+ * ENHANCED: Added conflict resolution, photo skip option, and sync progress tracking
  */
 class GoogleContactsAPIService {
 
@@ -170,6 +171,12 @@ class GoogleContactsAPIService {
 	}
 
 	/**
+	 * Import Google Contacts to Nextcloud address book with enhanced features:
+	 * - Conflict resolution (preserve local edits)
+	 * - Optional photo skipping
+	 * - Real-time sync progress tracking
+	 * - Error-resilient cleanup
+	 *
 	 * @param string $userId
 	 * @param ?string $uri
 	 * @param int $key
@@ -177,6 +184,10 @@ class GoogleContactsAPIService {
 	 * @return array
 	 */
 	public function importContacts(string $userId, ?string $uri, int $key, ?string $newAddrBookName): array {
+		// ===== ENHANCEMENT 1: Load user preferences =====
+		$skipPhotos = $this->config->getUserValue($userId, Application::APP_ID, 'contacts_skip_photos', '0') === '1';
+		$preserveLocalEdits = $this->config->getUserValue($userId, Application::APP_ID, 'contacts_preserve_local_edits', '1') === '1';
+		
 		$existingAddressBook = null;
 		if ($key === 0) {
 			$addressBooks = $this->contactsManager->getUserAddressBooks();
@@ -201,297 +212,368 @@ class GoogleContactsAPIService {
 				}
 			}
 			if (!$addressBook) {
+				// Cleanup progress on error
+				$this->config->deleteUserValue($userId, Application::APP_ID, 'contacts_sync_progress');
 				return ['error' => 'no such address book'];
 			}
 			$existingAddressBook = $addressBook;
 		}
+		
 		$otherContacts = $this->config->getUserValue($userId, Application::APP_ID, 'consider_other_contacts', '0') === '1';
 		$groupsById = $this->getContactGroupsById($userId);
 		$contacts = $this->getContactList($userId, $otherContacts);
+		
 		$nbAdded = 0;
 		$nbUpdated = 0;
 		$totalContactNumber = 0;
-		foreach ($contacts as $k => $c) {
-			$totalContactNumber++;
-
-			$googleResourceName = $c['resourceName'] ?? null;
-			if ($googleResourceName === null) {
-				$this->logger->debug('Skipping contact with no resourceName', ['contact' => $c, 'app' => Application::APP_ID]);
-				continue;
-			}
-			// contacts are not displayed in the Contacts app if there are slashes in their URI...
-			$googleResourceName = str_replace('/', '_', $googleResourceName);
-
-			// check if contact exists and needs to be updated
-			$existingContact = null;
-			if ($existingAddressBook !== null) {
-				$existingContact = $this->cdBackend->getCard($key, $googleResourceName);
-				if ($existingContact) {
-					$googleUpdateTime = $c['metadata']['sources'][0]['updateTime'] ?? null;
-					if ($googleUpdateTime === null) {
-						$googleUpdateTimestamp = 0;
-					} else {
-						try {
-							$googleUpdateTimestamp = (new DateTime($googleUpdateTime))->getTimestamp();
-						} catch (Exception|Throwable $e) {
-							$googleUpdateTimestamp = 0;
-						}
-					}
-
-					if ($googleUpdateTimestamp <= $existingContact['lastmodified']) {
-						$this->logger->debug('Skipping existing contact which is up-to-date', ['contact' => $c, 'app' => Application::APP_ID]);
-						continue;
-					}
-				}
-			}
-
-			$vCard = new VCard();
-
-			$displayName = '';
-			// we just take first name
-			if (isset($c['names']) && is_array($c['names'])) {
-				/** @var array{displayName?: string, familyName?: string, givenName?: string, middleName?: string, honorificPrefix?: string, honorificSuffix?: string } $n */
-				foreach ($c['names'] as $n) {
-					$displayName = $n['displayName'] ?? '';
-					$familyName = $n['familyName'] ?? '';
-					$firstName = $n['givenName'] ?? '';
-					$additionalName = $n['middleName'] ?? '';
-					$prefix = $n['honorificPrefix'] ?? '';
-					$suffix = $n['honorificSuffix'] ?? '';
-					if ($familyName || $firstName || $additionalName || $prefix || $suffix) {
-						$prop = $vCard->createProperty('N', [0 => $familyName, 1 => $firstName, 2 => $additionalName, 3 => $prefix, 4 => $suffix]);
-						$vCard->add($prop);
-					}
-					break;
-				}
-			}
-			if ($displayName) {
-				$prop = $vCard->createProperty('FN', $displayName);
-				$vCard->add($prop);
-			}
-
-			// notes
-			if (isset($c['biographies']) && is_array($c['biographies'])) {
-				foreach ($c['biographies'] as $biography) {
-					if (isset($biography['value'], $biography['contentType']) && $biography['contentType'] === 'TEXT_PLAIN') {
-						$prop = $vCard->createProperty('NOTE', $biography['value']);
-						$vCard->add($prop);
-					}
-				}
-			}
-
-			// websites
-			if (isset($c['urls']) && is_array($c['urls'])) {
-				foreach ($c['urls'] as $url) {
-					if (isset($url['value'])) {
-						$params = [
-							'value' => 'uri',
-						];
-						if (isset($url['formattedType']) || isset($url['type'])) {
-							$params['type'] = $url['formattedType'] ?? $url['type'];
-						}
-						$prop = $vCard->createProperty('URL', $url['value'], $params);
-						$vCard->add($prop);
-					}
-				}
-			}
-
-			// group/label
-			if (isset($c['memberships']) && is_array($c['memberships'])) {
-				$contactGroupNames = [];
-				/** @var array{contactGroupMembership: array{contactGroupResourceName: mixed}} $membership */
-				foreach ($c['memberships'] as $membership) {
-					if (isset(
-						$membership['contactGroupMembership'],
-						$membership['contactGroupMembership']['contactGroupResourceName'],
-						$groupsById[$membership['contactGroupMembership']['contactGroupResourceName']]
-					)) {
-						$group = $groupsById[$membership['contactGroupMembership']['contactGroupResourceName']];
-						$groupName = $group['formattedName'];
-						$contactGroupNames[] = $groupName;
-					}
-				}
-				if (!empty($contactGroupNames)) {
-					$prop = $vCard->createProperty('CATEGORIES', $contactGroupNames);
-					$vCard->add($prop);
-				}
-			}
-
-			// photo
-			if (isset($c['photos']) && is_array($c['photos'])) {
-				foreach ($c['photos'] as $photo) {
-					if (isset($photo['url'])) {
-						// determine photo type
-						$type = 'JPEG';
-						if (preg_match('/\.jpg$/i', $photo['url']) || preg_match('/\.jpeg$/i', $photo['url'])) {
-							$type = 'JPEG';
-						} elseif (preg_match('/\.png$/i', $photo['url'])) {
-							$type = 'PNG';
-						}
-						$photoFile = $this->googleApiService->simpleRequest($userId, $photo['url']);
-						if (!isset($photoFile['error'])) {
-							// try again to determine photo type from response headers
-							if (isset($photoFile['headers'], $photoFile['headers']['Content-Type'])) {
-								if (is_array($photoFile['headers']['Content-Type']) && count($photoFile['headers']['Content-Type']) > 0) {
-									$contentType = $photoFile['headers']['Content-Type'][0];
-								} else {
-									$contentType = $photoFile['headers']['Content-Type'];
-								}
-								if ($contentType === 'image/png') {
-									$type = 'PNG';
-								} elseif ($contentType === 'image/jpeg') {
-									$type = 'JPEG';
-								}
-							}
-
-							$b64Photo = stripslashes('data:image/' . strtolower($type) . ';base64\,') . base64_encode($photoFile['body']);
-							try {
-								$prop = $vCard->createProperty(
-									'PHOTO',
-									$b64Photo,
-									[
-										'type' => $type,
-										// 'encoding' => 'b',
-									]
-								);
-								$vCard->add($prop);
-							} catch (Exception|Throwable $ex) {
-								$this->logger->warning('Error when setting contact photo "' . '<redacted>' . '" ' . $ex->getMessage(), ['app' => Application::APP_ID]);
-							}
-							break;
-						}
-					}
-				}
-			}
-
-			// address
-			if (isset($c['addresses']) && is_array($c['addresses'])) {
-				/** @var array{streetAddress?: string, extendedAddress?: string, postalCode?: string, city?: string, type?: string, country?: string, poBox?: string} $address */
-				foreach ($c['addresses'] as $address) {
-					$streetAddress = $address['streetAddress'] ?? '';
-					$extendedAddress = $address['extendedAddress'] ?? '';
-					$postalCode = $address['postalCode'] ?? '';
-					$city = $address['city'] ?? '';
-					$addrType = $address['type'] ?? '';
-					$country = $address['country'] ?? '';
-					$postOfficeBox = $address['poBox'] ?? '';
-
-					$type = $addrType ? ['TYPE' => strtoupper($addrType)] : null;
-					$addrProp = $vCard->createProperty('ADR',
-						[0 => $postOfficeBox, 1 => $extendedAddress, 2 => $streetAddress, 3 => $city, 4 => '', 5 => $postalCode, 6 => $country],
-						$type
+		
+		try {
+			foreach ($contacts as $k => $c) {
+				$totalContactNumber++;
+				
+				// ===== ENHANCEMENT 2: Progress tracking (every 10 contacts) =====
+				if ($k % 10 === 0) {
+					$progress = [
+						'current' => $totalContactNumber,
+						'total' => 0, // Unknown total (generator), frontend shows "Processing..."
+						'status' => 'running',
+						'message' => "Processing contact #{$totalContactNumber}",
+						'timestamp' => time()
+					];
+					$this->config->setUserValue(
+						$userId,
+						Application::APP_ID,
+						'contacts_sync_progress',
+						json_encode($progress)
 					);
-					$vCard->add($addrProp);
 				}
-			}
-
-			// birthday
-			if (isset($c['birthdays']) && is_array($c['birthdays'])) {
-				foreach ($c['birthdays'] as $birthday) {
-					if (isset($birthday['date'], $birthday['date']['year'], $birthday['date']['month'], $birthday['date']['day'])) {
-						$date = new DateTime($birthday['date']['year'] . '-' . $birthday['date']['month'] . '-' . $birthday['date']['day']);
-						$strDate = $date->format('Ymd');
-
-						$type = ['VALUE' => 'DATE'];
-						$prop = $vCard->createProperty('BDAY', $strDate, $type);
-						$vCard->add($prop);
-					} elseif (isset($birthday['date'], $birthday['date']['month'], $birthday['date']['day'])) {
-						$type = ['VALUE' => 'DATE'];
-						$month = $birthday['date']['month'];
-						$month = strlen($month) === 2 ? $month : '0' . $month;
-						$day = $birthday['date']['day'];
-						$day = strlen($day) === 2 ? $day : '0' . $day;
-						if (strlen($month) === 2 && strlen($day) === 2) {
-							$prop = $vCard->createProperty('BDAY', '--' . $month . $day, $type);
+				
+				$googleResourceName = $c['resourceName'] ?? null;
+				if ($googleResourceName === null) {
+					$this->logger->debug('Skipping contact with no resourceName', ['contact' => $c, 'app' => Application::APP_ID]);
+					continue;
+				}
+				// contacts are not displayed in the Contacts app if there are slashes in their URI...
+				$googleResourceName = str_replace('/', '_', $googleResourceName);
+				
+				// ===== ENHANCEMENT 3: Conflict resolution logic =====
+				$existingContact = null;
+				if ($existingAddressBook !== null) {
+					$existingContact = $this->cdBackend->getCard($key, $googleResourceName);
+					if ($existingContact && $preserveLocalEdits) {
+						$googleUpdateTime = $c['metadata']['sources'][0]['updateTime'] ?? null;
+						if ($googleUpdateTime === null) {
+							$googleUpdateTimestamp = 0;
+						} else {
+							try {
+								$googleUpdateTimestamp = (new DateTime($googleUpdateTime))->getTimestamp();
+							} catch (Exception|Throwable $e) {
+								$googleUpdateTimestamp = 0;
+							}
+						}
+						
+						// Skip update if local edit is newer AND preserve mode is enabled
+						if ($googleUpdateTimestamp <= $existingContact['lastmodified']) {
+							$this->logger->debug('Skipping contact update - local edit is newer (preserve mode)', [
+								'resourceName' => $googleResourceName,
+								'google_time' => $googleUpdateTimestamp,
+								'local_time' => $existingContact['lastmodified'],
+								'app' => Application::APP_ID
+							]);
+							continue;
+						}
+					}
+					// If preserveLocalEdits=false: proceed to update (overwrite local)
+				}
+				
+				$vCard = new VCard();
+				
+				$displayName = '';
+				// we just take first name
+				if (isset($c['names']) && is_array($c['names'])) {
+					/** @var array{displayName?: string, familyName?: string, givenName?: string, middleName?: string, honorificPrefix?: string, honorificSuffix?: string } $n */
+					foreach ($c['names'] as $n) {
+						$displayName = $n['displayName'] ?? '';
+						$familyName = $n['familyName'] ?? '';
+						$firstName = $n['givenName'] ?? '';
+						$additionalName = $n['middleName'] ?? '';
+						$prefix = $n['honorificPrefix'] ?? '';
+						$suffix = $n['honorificSuffix'] ?? '';
+						if ($familyName || $firstName || $additionalName || $prefix || $suffix) {
+							$prop = $vCard->createProperty('N', [0 => $familyName, 1 => $firstName, 2 => $additionalName, 3 => $prefix, 4 => $suffix]);
 							$vCard->add($prop);
 						}
-					} elseif (isset($birthday['text']) && is_string($birthday['text'])) {
-						$type = ['VALUE' => 'text'];
-						$prop = $vCard->createProperty('BDAY', $birthday['text'], $type);
+						break;
+					}
+				}
+				if ($displayName) {
+					$prop = $vCard->createProperty('FN', $displayName);
+					$vCard->add($prop);
+				}
+				
+				// notes
+				if (isset($c['biographies']) && is_array($c['biographies'])) {
+					foreach ($c['biographies'] as $biography) {
+						if (isset($biography['value'], $biography['contentType']) && $biography['contentType'] === 'TEXT_PLAIN') {
+							$prop = $vCard->createProperty('NOTE', $biography['value']);
+							$vCard->add($prop);
+						}
+					}
+				}
+				
+				// websites
+				if (isset($c['urls']) && is_array($c['urls'])) {
+					foreach ($c['urls'] as $url) {
+						if (isset($url['value'])) {
+							$params = [
+								'value' => 'uri',
+							];
+							if (isset($url['formattedType']) || isset($url['type'])) {
+								$params['type'] = $url['formattedType'] ?? $url['type'];
+							}
+							$prop = $vCard->createProperty('URL', $url['value'], $params);
+							$vCard->add($prop);
+						}
+					}
+				}
+				
+				// group/label
+				if (isset($c['memberships']) && is_array($c['memberships'])) {
+					$contactGroupNames = [];
+					/** @var array{contactGroupMembership: array{contactGroupResourceName: mixed}} $membership */
+					foreach ($c['memberships'] as $membership) {
+						if (isset(
+							$membership['contactGroupMembership'],
+							$membership['contactGroupMembership']['contactGroupResourceName'],
+							$groupsById[$membership['contactGroupMembership']['contactGroupResourceName']]
+						)) {
+							$group = $groupsById[$membership['contactGroupMembership']['contactGroupResourceName']];
+							$groupName = $group['formattedName'];
+							$contactGroupNames[] = $groupName;
+						}
+					}
+					if (!empty($contactGroupNames)) {
+						$prop = $vCard->createProperty('CATEGORIES', $contactGroupNames);
 						$vCard->add($prop);
 					}
 				}
-			}
-
-			if (isset($c['nicknames']) && is_array($c['nicknames'])) {
-				foreach ($c['nicknames'] as $nick) {
-					if (isset($nick['value'])) {
-						$prop = $vCard->createProperty('NICKNAME', $nick['value']);
-						$vCard->add($prop);
+				
+				// ===== ENHANCEMENT 4: Conditional photo download =====
+				if (!$skipPhotos && isset($c['photos']) && is_array($c['photos'])) {
+					foreach ($c['photos'] as $photo) {
+						if (isset($photo['url'])) {
+							// determine photo type
+							$type = 'JPEG';
+							if (preg_match('/\.jpg$/i', $photo['url']) || preg_match('/\.jpeg$/i', $photo['url'])) {
+								$type = 'JPEG';
+							} elseif (preg_match('/\.png$/i', $photo['url'])) {
+								$type = 'PNG';
+							}
+							$photoFile = $this->googleApiService->simpleRequest($userId, $photo['url']);
+							if (!isset($photoFile['error'])) {
+								// try again to determine photo type from response headers
+								if (isset($photoFile['headers'], $photoFile['headers']['Content-Type'])) {
+									if (is_array($photoFile['headers']['Content-Type']) && count($photoFile['headers']['Content-Type']) > 0) {
+										$contentType = $photoFile['headers']['Content-Type'][0];
+									} else {
+										$contentType = $photoFile['headers']['Content-Type'];
+									}
+									if ($contentType === 'image/png') {
+										$type = 'PNG';
+									} elseif ($contentType === 'image/jpeg') {
+										$type = 'JPEG';
+									}
+								}
+								
+								$b64Photo = stripslashes('data:image/' . strtolower($type) . ';base64\,') . base64_encode($photoFile['body']);
+								try {
+									$prop = $vCard->createProperty(
+										'PHOTO',
+										$b64Photo,
+										[
+											'type' => $type,
+											// 'encoding' => 'b',
+										]
+									);
+									$vCard->add($prop);
+								} catch (Exception|Throwable $ex) {
+									$this->logger->warning('Error when setting contact photo', [
+										'contact' => $googleResourceName,
+										'error' => $ex->getMessage(),
+										'app' => Application::APP_ID
+									]);
+								}
+								break;
+							}
+						}
 					}
+				} elseif ($skipPhotos && isset($c['photos'])) {
+					$this->logger->debug('Skipped photo download for contact (user preference)', [
+						'resourceName' => $googleResourceName,
+						'app' => Application::APP_ID
+					]);
 				}
-			}
-
-			if (isset($c['emailAddresses']) && is_array($c['emailAddresses'])) {
-				/** @var array{value?: string, type?: string} $email */
-				foreach ($c['emailAddresses'] as $email) {
-					if (isset($email['value'])) {
-						$addrType = $email['type'] ?? '';
+				
+				// address
+				if (isset($c['addresses']) && is_array($c['addresses'])) {
+					/** @var array{streetAddress?: string, extendedAddress?: string, postalCode?: string, city?: string, type?: string, country?: string, poBox?: string} $address */
+					foreach ($c['addresses'] as $address) {
+						$streetAddress = $address['streetAddress'] ?? '';
+						$extendedAddress = $address['extendedAddress'] ?? '';
+						$postalCode = $address['postalCode'] ?? '';
+						$city = $address['city'] ?? '';
+						$addrType = $address['type'] ?? '';
+						$country = $address['country'] ?? '';
+						$postOfficeBox = $address['poBox'] ?? '';
+						
 						$type = $addrType ? ['TYPE' => strtoupper($addrType)] : null;
-						$prop = $vCard->createProperty('EMAIL', $email['value'], $type);
-						$vCard->add($prop);
+						$addrProp = $vCard->createProperty('ADR',
+							[0 => $postOfficeBox, 1 => $extendedAddress, 2 => $streetAddress, 3 => $city, 4 => '', 5 => $postalCode, 6 => $country],
+							$type
+						);
+						$vCard->add($addrProp);
+					}
+				}
+				
+				// birthday
+				if (isset($c['birthdays']) && is_array($c['birthdays'])) {
+					foreach ($c['birthdays'] as $birthday) {
+						if (isset($birthday['date'], $birthday['date']['year'], $birthday['date']['month'], $birthday['date']['day'])) {
+							$date = new DateTime($birthday['date']['year'] . '-' . $birthday['date']['month'] . '-' . $birthday['date']['day']);
+							$strDate = $date->format('Ymd');
+							
+							$type = ['VALUE' => 'DATE'];
+							$prop = $vCard->createProperty('BDAY', $strDate, $type);
+							$vCard->add($prop);
+						} elseif (isset($birthday['date'], $birthday['date']['month'], $birthday['date']['day'])) {
+							$type = ['VALUE' => 'DATE'];
+							$month = $birthday['date']['month'];
+							$month = strlen($month) === 2 ? $month : '0' . $month;
+							$day = $birthday['date']['day'];
+							$day = strlen($day) === 2 ? $day : '0' . $day;
+							if (strlen($month) === 2 && strlen($day) === 2) {
+								$prop = $vCard->createProperty('BDAY', '--' . $month . $day, $type);
+								$vCard->add($prop);
+							}
+						} elseif (isset($birthday['text']) && is_string($birthday['text'])) {
+							$type = ['VALUE' => 'text'];
+							$prop = $vCard->createProperty('BDAY', $birthday['text'], $type);
+							$vCard->add($prop);
+						}
+					}
+				}
+				
+				if (isset($c['nicknames']) && is_array($c['nicknames'])) {
+					foreach ($c['nicknames'] as $nick) {
+						if (isset($nick['value'])) {
+							$prop = $vCard->createProperty('NICKNAME', $nick['value']);
+							$vCard->add($prop);
+						}
+					}
+				}
+				
+				if (isset($c['emailAddresses']) && is_array($c['emailAddresses'])) {
+					/** @var array{value?: string, type?: string} $email */
+					foreach ($c['emailAddresses'] as $email) {
+						if (isset($email['value'])) {
+							$addrType = $email['type'] ?? '';
+							$type = $addrType ? ['TYPE' => strtoupper($addrType)] : null;
+							$prop = $vCard->createProperty('EMAIL', $email['value'], $type);
+							$vCard->add($prop);
+						}
+					}
+				}
+				
+				if (isset($c['phoneNumbers']) && is_array($c['phoneNumbers'])) {
+					foreach ($c['phoneNumbers'] as $ph) {
+						if (isset($ph['value'])) {
+							$numberType = str_replace('mobile', 'cell', $ph['type'] ?? '');
+							$numberType = str_replace('main', '', $numberType);
+							$numberType = $numberType ?: 'home';
+							$type = ['TYPE' => strtoupper($numberType)];
+							$prop = $vCard->createProperty('TEL', $ph['value'], $type);
+							$vCard->add($prop);
+						}
+					}
+				}
+				
+				// we just take first org
+				if (isset($c['organizations']) && is_array($c['organizations'])) {
+					/** @var array{title?: string, name?: string} $org */
+					foreach ($c['organizations'] as $org) {
+						$name = $org['name'] ?? '';
+						if ($name) {
+							$prop = $vCard->createProperty('ORG', $name);
+							$vCard->add($prop);
+						}
+						
+						$title = $org['title'] ?? '';
+						if ($title) {
+							$prop = $vCard->createProperty('TITLE', $title);
+							$vCard->add($prop);
+						}
+						break;
+					}
+				}
+				
+				// Create or update contact
+				if ($existingContact === null || $existingContact === false) {
+					try {
+						$this->cdBackend->createCard($key, $googleResourceName, $vCard->serialize());
+						$nbAdded++;
+					} catch (Throwable|Exception $e) {
+						$this->logger->warning('Error when creating contact', [
+							'contact' => $googleResourceName,
+							'exception' => $e->getMessage(),
+							'app' => Application::APP_ID
+						]);
+					}
+				} else {
+					try {
+						$this->cdBackend->updateCard($key, $googleResourceName, $vCard->serialize());
+						$nbUpdated++;
+					} catch (Throwable|Exception $e) {
+						$this->logger->warning('Error when updating contact', [
+							'contact' => $googleResourceName,
+							'exception' => $e->getMessage(),
+							'app' => Application::APP_ID
+						]);
 					}
 				}
 			}
-
-			if (isset($c['phoneNumbers']) && is_array($c['phoneNumbers'])) {
-				foreach ($c['phoneNumbers'] as $ph) {
-					if (isset($ph['value'])) {
-						$numberType = str_replace('mobile', 'cell', $ph['type'] ?? '');
-						$numberType = str_replace('main', '', $numberType);
-						$numberType = $numberType ?: 'home';
-						$type = ['TYPE' => strtoupper($numberType)];
-						$prop = $vCard->createProperty('TEL', $ph['value'], $type);
-						$vCard->add($prop);
-					}
-				}
+			
+			// Final progress cleanup and stats save
+			$this->config->deleteUserValue($userId, Application::APP_ID, 'contacts_sync_progress');
+			$this->config->setUserValue($userId, Application::APP_ID, 'contacts_total_count', $totalContactNumber);
+			$this->config->setUserValue($userId, Application::APP_ID, 'contacts_last_sync', time());
+			
+			$this->logger->info("Contacts sync completed: {$totalContactNumber} processed, {$nbAdded} added, {$nbUpdated} updated", [
+				'user' => $userId,
+				'app' => Application::APP_ID
+			]);
+			
+			// Check generator return value for errors
+			$contactGeneratorReturn = $contacts->getReturn();
+			if (isset($contactGeneratorReturn['error'])) {
+				return $contactGeneratorReturn;
 			}
-
-			// we just take first org
-			if (isset($c['organizations']) && is_array($c['organizations'])) {
-				/** @var array{title?: string, name?: string} $org */
-				foreach ($c['organizations'] as $org) {
-					$name = $org['name'] ?? '';
-					if ($name) {
-						$prop = $vCard->createProperty('ORG', $name);
-						$vCard->add($prop);
-					}
-
-					$title = $org['title'] ?? '';
-					if ($title) {
-						$prop = $vCard->createProperty('TITLE', $title);
-						$vCard->add($prop);
-					}
-					break;
-				}
-			}
-
-			if ($existingContact === null || $existingContact === false) {
-				try {
-					$this->cdBackend->createCard($key, $googleResourceName, $vCard->serialize());
-					$nbAdded++;
-				} catch (Throwable|Exception $e) {
-					$this->logger->warning('Error when creating contact', ['exception' => $e, 'contact' => $c, 'app' => Application::APP_ID]);
-				}
-			} else {
-				try {
-					$this->cdBackend->updateCard($key, $googleResourceName, $vCard->serialize());
-					$nbUpdated++;
-				} catch (Throwable|Exception $e) {
-					$this->logger->warning('Error when updating contact', ['exception' => $e, 'contact' => $c, 'app' => Application::APP_ID]);
-				}
-			}
+			
+			return [
+				'nbSeen' => $totalContactNumber,
+				'nbAdded' => $nbAdded,
+				'nbUpdated' => $nbUpdated,
+			];
+			
+		} catch (\Throwable $e) {
+			// Ensure progress is cleaned on ANY error
+			$this->config->deleteUserValue($userId, Application::APP_ID, 'contacts_sync_progress');
+			$this->logger->error("Critical error during contacts sync", [
+				'user' => $userId,
+				'exception' => $e->getMessage(),
+				'trace' => $e->getTraceAsString(),
+				'app' => Application::APP_ID
+			]);
+			throw $e; // Re-throw to be handled by caller
 		}
-		$this->logger->debug($totalContactNumber . ' contacts seen', ['app' => Application::APP_ID]);
-		$this->logger->debug($nbAdded . ' contacts imported', ['app' => Application::APP_ID]);
-		$contactGeneratorReturn = $contacts->getReturn();
-		if (isset($contactGeneratorReturn['error'])) {
-			return $contactGeneratorReturn;
-		}
-		return [
-			'nbSeen' => $totalContactNumber,
-			'nbAdded' => $nbAdded,
-			'nbUpdated' => $nbUpdated,
-		];
 	}
 }
